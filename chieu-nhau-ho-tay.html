@@ -96,6 +96,9 @@ h1{margin:0;display:inline-block;font-family:var(--f-sign);font-weight:400;font-
 .online .who{flex:1;min-width:0;font-weight:700;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .online .who small{display:block;font-weight:400;color:var(--muted);font-size:12px}
 .online .chip:disabled{opacity:.5;cursor:default}
+.room-line{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px}
+.room-line b{color:var(--lamp)}
+.link-box{flex:1 1 100%;min-width:0;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:12px}
 .hint{margin:0;font-size:13px;color:var(--muted);text-wrap:pretty}
 .hint kbd{font:12px/1 var(--f-body);border:1px solid var(--line);border-radius:4px;padding:2px 5px;color:var(--ink)}
 
@@ -249,7 +252,13 @@ footer{max-width:1280px;margin:0 auto;color:var(--muted);font-size:12px;
       <div class="online-box">
         <h3>Ai đang ở phố</h3>
         <ul class="online" id="online"></ul>
-        <p class="small">Muốn rủ người chưa vào trang: mở menu Share của trang, gửi link cho họ với quyền Contributor. Họ mở link là xuất hiện trên phố, bạn bấm "Mời vào mâm".</p>
+        <div class="room-line" id="roomLine" hidden>
+          <span>Phòng: <b id="roomName">pho-chung</b></span>
+          <button type="button" class="chip" id="copyLink">Copy link mời</button>
+          <button type="button" class="chip" id="newRoom">Tạo phòng riêng</button>
+          <input id="linkBox" class="link-box" readonly hidden aria-label="Link mời">
+        </div>
+        <p class="small" id="shareNote">Muốn rủ người chưa vào trang: mở menu Share của trang, gửi link cho họ với quyền Contributor. Họ mở link là xuất hiện trên phố, bạn bấm "Mời vào mâm".</p>
       </div>
       <ul class="log" id="log" aria-live="polite"></ul>
       <div class="chips" id="chips"></div>
@@ -821,7 +830,8 @@ async function send(topic,data){
 let offT=null;
 function setConn(state){
   const el=$('#conn');clearTimeout(offT);
-  if(state==='on'){el.className='conn on';el.textContent='Đang online cùng mọi người'}
+  if(state==='on'){el.className='conn on';el.textContent=relayInfo?`Online · phòng ${relayInfo.code} · máy chủ ${relayInfo.broker}`:'Đang online cùng mọi người'}
+  else if(state==='relay'){el.className='conn off';el.textContent='Đang kết nối máy chủ online…'}
   else if(state==='off'){offT=setTimeout(()=>{el.className='conn off';el.textContent='Mất kết nối, đang nối lại…'},2000)}
   else{el.className='conn';el.textContent='Đi một mình (không kết nối phòng)'}
 }
@@ -847,9 +857,111 @@ function handlePeers(ch){
   if(S.s>=0){const t=takenSeats().get(S.s);if(t&&t.j<=S.j){const g=groupOf(S.s);S.s=-1;sitGroup(g)}}
   renderPanels();
 }
+/* ================= Playing together outside claude.ai: public MQTT relay ================= */
+const MQTT_LIBS=['https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js','https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js'];
+// Free public brokers, tried in order; everyone normally lands on the first one. The last one runs on port 443 for networks that block other ports.
+const BROKERS=[{url:'wss://broker.emqx.io:8084/mqtt',name:'EMQX'},{url:'wss://broker.hivemq.com:8884/mqtt',name:'HiveMQ'},{url:'wss://public.cloud.shiftr.io',name:'shiftr',user:'public',pass:'public'}];
+let relayInfo=null;
+function roomCode(){const h=decodeURIComponent((location.hash||'').slice(1)).toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,32);return h||'pho-chung'}
+function loadScript(src){return new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=rej;document.head.appendChild(s)})}
+async function createRelayRoom(){
+  for(const src of MQTT_LIBS){if(window.mqtt)break;try{await loadScript(src)}catch(e){}}
+  if(!window.mqtt)return null;
+  const code=roomCode(),base='chieunhauhotay/v1/'+code,me=Math.random().toString(36).slice(2,12);
+  const peers=new Map(),handlers={},peerHandlers=[],connHandlers=[];
+  let myPres={},client=null,broker=null,connected=false,snapshot=Object.freeze([]),pubT=null,lastPub=0;
+  const asPeer=(peer,v,mine)=>({peer,by:null,isMe:mine,sameTab:mine,kind:'viewer',guest:false,presence:v.presence,updatedAt:v.updatedAt});
+  function rebuild(joined,left,updated){
+    snapshot=Object.freeze([asPeer(me,{presence:myPres,updatedAt:Date.now()},true),...[...peers.entries()].map(([p,v])=>asPeer(p,v,false))]);
+    const ch={peers:snapshot,joined:joined||[],left:left||[],updated:updated||[]};
+    peerHandlers.forEach(h=>{try{h(ch)}catch(e){}});
+  }
+  function publishPresence(){
+    pubT=null;lastPub=Date.now();
+    if(client&&connected)client.publish(base+'/p/'+me,JSON.stringify({p:myPres,t:Date.now()}),{qos:0,retain:true});
+  }
+  function schedulePresence(){if(pubT)return;pubT=setTimeout(publishPresence,Math.max(0,120-(Date.now()-lastPub)))}
+  function tryBroker(b){
+    return new Promise(resolve=>{
+      const opts={clientId:'cn_'+me,clean:true,keepalive:20,reconnectPeriod:3000,connectTimeout:7000,will:{topic:base+'/p/'+me,payload:'',qos:0,retain:true}};
+      if(b.user){opts.username=b.user;opts.password=b.pass}
+      const c=window.mqtt.connect(b.url,opts);
+      let done=false;
+      const timer=setTimeout(()=>{if(done)return;done=true;try{c.end(true)}catch(e){}resolve(null)},8000);
+      c.once('connect',()=>{if(done)return;done=true;clearTimeout(timer);resolve(c)});
+      c.on('error',()=>{});
+    });
+  }
+  for(const b of BROKERS){client=await tryBroker(b);if(client){broker=b.name;break}}
+  if(!client)return null;
+  const onConnect=()=>{connected=true;client.subscribe(base+'/#',{qos:0});publishPresence();connHandlers.forEach(h=>h(true))};
+  client.on('connect',onConnect);
+  client.on('close',()=>{if(connected){connected=false;connHandlers.forEach(h=>h(false))}});
+  client.on('message',(topic,buf,packet)=>{
+    const rest=topic.slice(base.length+1);let txt='';
+    try{txt=new TextDecoder().decode(buf)}catch(e){return}
+    if(rest.startsWith('p/')){
+      const peer=rest.slice(2).replace(/[^a-z0-9]/g,'').slice(0,16);if(!peer||peer===me)return;
+      if(!txt){const v=peers.get(peer);if(v){peers.delete(peer);rebuild([],[asPeer(peer,v,false)],[])}return}
+      let d;try{d=JSON.parse(txt)}catch(e){return}
+      if(!d||typeof d!=='object'||!d.p||typeof d.p!=='object'||Array.isArray(d.p))return;
+      if(packet&&packet.retain&&Math.abs(Date.now()-(Number(d.t)||0))>60000)return; // a ghost left behind by someone long gone
+      const had=peers.has(peer),v={presence:d.p,seen:Date.now(),updatedAt:Date.now()};peers.set(peer,v);
+      const P=asPeer(peer,v,false);rebuild(had?[]:[P],[],had?[P]:[]);
+    }else if(rest.startsWith('e/')){
+      const tp=rest.slice(2);let d;try{d=JSON.parse(txt)}catch(e){return}
+      if(!d||typeof d!=='object')return;
+      const from=String(d.f||'').slice(0,16),mine=from===me;
+      if(!mine&&!peers.has(from))return;
+      const msg={peer:from,by:null,isMe:mine,sameTab:mine,kind:'viewer',guest:false,topic:tp,data:d.d};
+      (handlers[tp]||[]).forEach(h=>{try{h(msg)}catch(e){}});
+    }
+  });
+  setInterval(()=>{
+    if(connected)publishPresence();
+    const now=Date.now(),gone=[];
+    for(const[p,v]of peers)if(now-v.seen>16000){peers.delete(p);gone.push(asPeer(p,v,false))}
+    if(gone.length)rebuild([],gone,[]);
+  },5000);
+  window.addEventListener('pagehide',()=>{try{client.publish(base+'/p/'+me,'',{qos:0,retain:true});client.end()}catch(e){}});
+  onConnect();
+  return{
+    emit(topic,data){if(client&&connected)client.publish(base+'/e/'+topic,JSON.stringify({f:me,d:data===undefined?null:data}),{qos:0});return Promise.resolve()},
+    on(topic,fn){(handlers[topic]=handlers[topic]||[]).push(fn);return()=>{handlers[topic]=(handlers[topic]||[]).filter(h=>h!==fn)}},
+    presence(patch){for(const k in patch){if(patch[k]===null)delete myPres[k];else myPres[k]=patch[k]}schedulePresence();return Promise.resolve()},
+    peers(){return snapshot},
+    onPeers(fn){peerHandlers.push(fn);setTimeout(()=>{rebuild(snapshot,[],[])},0);return()=>{}},
+    connected(){return connected},
+    onConnection(fn){connHandlers.push(fn);setTimeout(()=>fn(connected),0);return()=>{}},
+    info:{code,broker}
+  };
+}
+function renderRoomLine(){
+  const box=$('#roomLine');if(!box)return;
+  box.hidden=!relayInfo;
+  $('#shareNote').textContent=relayInfo
+    ?'Gửi link phòng này cho bạn bè: ai mở là xuất hiện trên phố, rồi bạn bấm "Mời vào mâm". Phòng "pho-chung" ai cũng vào được; muốn chỉ hội mình thì tạo phòng riêng.'
+    :'Muốn rủ người chưa vào trang: mở menu Share của trang, gửi link cho họ với quyền Contributor. Họ mở link là xuất hiện trên phố, bạn bấm "Mời vào mâm".';
+  if(relayInfo)$('#roomName').textContent=relayInfo.code;
+}
+$('#copyLink').addEventListener('click',async()=>{
+  const url=location.href,b=$('#copyLink');
+  try{await navigator.clipboard.writeText(url);b.textContent='Đã copy link'}
+  catch(e){const i=$('#linkBox');i.hidden=false;i.value=url;i.select();b.textContent='Bôi đen sẵn rồi, copy nhé'}
+  setTimeout(()=>{b.textContent='Copy link mời'},2500);
+});
+$('#newRoom').addEventListener('click',()=>{location.hash='ban-'+Math.random().toString(36).slice(2,7)});
+window.addEventListener('hashchange',()=>{if(relayInfo&&roomCode()!==relayInfo.code)location.reload()});
+
 async function connectRoom(){
   let r=null;
-  try{r=(window.claude&&typeof window.claude.use==='function')?await window.claude.use('room'):null}catch(e){r=null}
+  const inClaude=!!(window.claude&&typeof window.claude.use==='function');
+  try{r=inClaude?await window.claude.use('room'):null}catch(e){r=null}
+  if(!r&&!inClaude){
+    setConn('relay');
+    r=await createRelayRoom();
+    if(r){relayInfo=r.info;renderRoomLine();addLog('',`Đã vào phòng online "${relayInfo.code}". Ai mở cùng link này là gặp nhau trên phố.`,'',true)}
+  }
   if(!r){setConn('solo');return}
   room=r;
   const dead=()=>{room=null;peersSnap=[];setConn('solo');renderPanels()};
